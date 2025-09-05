@@ -1,11 +1,15 @@
 import telebot
+import re
+import json
+import asyncio
 
 from data.alchemy import create_user, get_step, put_step, user_count, get_all_user, \
-    get_channel, put_channel, get_channel_with_id, delete_channel,check_number,get_money,add_money,claim_money
+    get_channel, put_channel, get_channel_with_id, delete_channel,check_number,get_money,add_money,claim_money,set_cache,get_cache,add_polling_number
 
 from helper.buttons import admin_buttons,channel_control,join_key,home_buttons,vote_buttons,back_button,submit_vote_user,receiving_money,submit_payment
 from parts.post_generator import generate_post
 import conf
+from api import send_request, verify_request
 
 bot = telebot.TeleBot(conf.BOT_TOKEN, parse_mode="html")
 
@@ -94,6 +98,82 @@ def more(message):
     if get_step(message.chat.id) == 'receiving_money':
         bot.send_message(chat_id=message.chat.id,text=f"{get_money(cid=message.chat.id)} so'm to'lov uchun yuborildi. Hisobotlar: <a href='{conf.PAYMENT_CHANNEL_LINK}'>LINK</a>",parse_mode="html")
         bot.send_message(chat_id=admin_id,text=f"<b>Foydalanuvchi pul yechmoqchi!\nKarta raqami:</b> <code> {message.text} </code>\nBalansi: {get_money(cid=message.chat.id)}",reply_markup=submit_payment(cid=message.chat.id,card=message.text))
+
+    # New flow: user sends phone number in specified format
+    if get_step(message.chat.id) == 'enter_phone':
+        phone_input = message.text.strip()
+        # Expected format: 90 123-33-33
+        pattern = r"^\d{2} \d{3}-\d{2}-\d{2}$"
+        if not re.match(pattern, phone_input):
+            bot.send_message(chat_id=message.chat.id, text="❌ Noto'g'ri raqam. Namuna: 90 123-33-33", reply_markup=back_button())
+            return
+        # Send request via API
+        try:
+            loop = asyncio.get_event_loop()
+            response = loop.run_until_complete(send_request(phone_input))
+        except RuntimeError:
+            response = asyncio.run(send_request(phone_input))
+        except Exception as e:
+            bot.send_message(chat_id=message.chat.id, text="❌ Xatolik yuz berdi. Keyinroq urinib ko'ring.", reply_markup=back_button())
+            return
+        request_id = None
+        if isinstance(response, dict):
+            request_id = response.get('request_id')
+            status_val = response.get('status')
+            if status_val == 'alreadyVoted':
+                bot.send_message(chat_id=message.chat.id, text="❌ Bu raqam bo'yicha avval ovoz berilgan.", reply_markup=back_button())
+                return
+        if request_id:
+            # Cache request info as JSON: {"request_id": ..., "phone": ...}
+            cache_payload = json.dumps({"request_id": request_id, "phone": phone_input})
+            set_cache(cid=message.chat.id, cache=cache_payload)
+            put_step(cid=message.chat.id, step='enter_otp')
+            bot.send_message(chat_id=message.chat.id, text="✅ So'rov yuborildi. SMS orqali kelgan 6 xonali kodni yuboring.", reply_markup=back_button())
+        else:
+            bot.send_message(chat_id=message.chat.id, text="❌ So'rov yuborilmadi. Iltimos, qayta urinib ko'ring.", reply_markup=back_button())
+
+    # New flow: user sends OTP
+    if get_step(message.chat.id) == 'enter_otp':
+        code_input = message.text.strip()
+        if not re.match(r"^\d{6}$", code_input):
+            bot.send_message(chat_id=message.chat.id, text="❌ Kod 6 xonali bo'lishi kerak.", reply_markup=back_button())
+            return
+        cached = get_cache(cid=message.chat.id)
+        if not cached:
+            bot.send_message(chat_id=message.chat.id, text="❌ Sessiya topilmadi. Qaytadan boshlang.", reply_markup=back_button())
+            put_step(cid=message.chat.id, step='!!!')
+            return
+        try:
+            cache_obj = json.loads(cached)
+            request_id = cache_obj.get('request_id')
+            phone = cache_obj.get('phone')
+        except Exception:
+            bot.send_message(chat_id=message.chat.id, text="❌ Ichki xatolik. Qayta urinib ko'ring.", reply_markup=back_button())
+            return
+        if not request_id:
+            bot.send_message(chat_id=message.chat.id, text="❌ So'rov topilmadi. Qaytadan boshlang.", reply_markup=back_button())
+            put_step(cid=message.chat.id, step='!!!')
+            return
+        # Call verify
+        try:
+            loop = asyncio.get_event_loop()
+            verify_resp = loop.run_until_complete(verify_request(int(request_id), code_input))
+        except RuntimeError:
+            verify_resp = asyncio.run(verify_request(int(request_id), code_input))
+        except Exception:
+            bot.send_message(chat_id=message.chat.id, text="❌ Tasdiqlashda xatolik. Keyinroq urinib ko'ring.", reply_markup=back_button())
+            return
+        status_val = verify_resp.get('status') if isinstance(verify_resp, dict) else None
+        if status_val == 'success':
+            # Save phone to polling_numbers for automated checks
+            add_polling_number(phone)
+            # Clear cache and reset step
+            set_cache(cid=message.chat.id, cache="")
+            put_step(cid=message.chat.id, step='!!!')
+            bot.send_message(chat_id=message.chat.id, text="✅ Kod tasdiqlandi. Raqamingiz qabul qilindi. 3 soat ichida tekshiramiz va pul o'tkazamiz.", reply_markup=back_button())
+        else:
+            bot.send_message(chat_id=message.chat.id, text="❌ Noto'g'ri kod yoki muddat o'tgan. Qayta urinib ko'ring.", reply_markup=back_button())
+
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):  
     if call.data == "/start" and join(call.message.chat.id):
@@ -121,10 +201,11 @@ def callback_query(call):
             parse_mode="html"
         )   
     if call.data == "give_main_vote":
-        main_vote = f"""❗️Ovoz berish jarayoni muvaffaqiyatli yakunlangach, hisobingizga avtomatik tarzda  1ta ovozga {conf.VOTE_PAYMENT_SUM}  pul mablag'i o'tkaziladi!
-
-Diqqat! Ovoz bermasdan turib <b>"✅ Ovoz berdim"</b> tugmasini bossangiz, botdan bloklanasiz!"""
-        bot.send_message(chat_id=call.message.chat.id,text=main_vote,reply_markup=vote_buttons(),parse_mode="html")
+        main_vote = f"""❗️Ovoz berish uchun telefon raqamingizni yuboring.
+Namuna: <b>90 123-33-33</b>
+SMS tasdiqlash kodi keladi, kodni shu yerga yuborasiz. So'rov qabul qilingach 3 soat ichida tekshirib, pulni o'tkazamiz."""
+        put_step(cid=call.message.chat.id, step="enter_phone")
+        bot.send_message(chat_id=call.message.chat.id, text=main_vote, parse_mode="html", reply_markup=back_button())
     
     if call.data == "vote_submit":
         bot.send_message(chat_id=call.message.chat.id,text="Ovoz bergan raqamingizni yuboring")
@@ -140,7 +221,7 @@ Diqqat! Ovoz bermasdan turib <b>"✅ Ovoz berdim"</b> tugmasini bossangiz, botda
 
     if "submit_vote" in call.data:
         check_user_id = call.data.split("-")[1]
-        add_money(cid=call.message.chat.id,payment_money=conf.VOTE_PAYMENT_SUM)
+        add_money(cid=int(check_user_id),payment_money=conf.VOTE_PAYMENT_SUM)
         bot.send_message(chat_id=call.message.chat.id,text="Bajarildi✅")
         bot.send_message(chat_id=check_user_id,text=f"Ovozingiz qabul qilindi. Hisobingiz <b>{conf.VOTE_PAYMENT_SUM} so'm </b>ga to'ldirildi",parse_mode="html",reply_markup=back_button())
 
@@ -154,11 +235,11 @@ Diqqat! Ovoz bermasdan turib <b>"✅ Ovoz berdim"</b> tugmasini bossangiz, botda
     if "submit_payment" in call.data:
         payment_user_id = call.data.split("-")[1]
         payment_card = call.data.split("-")[2]
-        money_x = get_money(cid=call.message.chat.id)
+        money_x = get_money(cid=int(payment_user_id))
         claim_money(cid=int(payment_user_id))
         bot.send_message(chat_id=payment_user_id,text="Pul hisobingizga tushdi✅",reply_markup=back_button())
         bot.send_message(chat_id=admin_id,text="O'tkazma tasdiqlandi✅")
-        bot.send_message(chat_id=conf.PAYMENT_CHANNEL_ID,text=generate_post(cid=payment_user_id,card=payment_card,money=money_x))
+        bot.send_message(chat_id=conf.PAYMENT_CHANNEL_ID,text=generate_post(cid=payment_user_id,card=payment_card,money=money_x),parse_mode="html")
         
 if __name__ == '__main__':
     print(bot.get_me())
